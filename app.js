@@ -22,9 +22,17 @@
     people: new Map(), names: new Map(), settings: { notice: '', room_locked: false, room_max: 8 },
     lobby: null, room: null, inRoom: false, rtc: new Map(), local: null, raw: null, blur: null,
     micOn: true, camOn: false, pip: null,
+    rooms: [], roomId: null, roomInfo: null, roomJoinedAt: 0, chat: [], pingT: null, rtimer: null,
     prefs: Object.assign({ blur: true, mirror: true, theme: '', micOn: true }, load('nestmate-prefs')),
   };
   function load(k) { try { return JSON.parse(localStorage.getItem(k) || '{}') || {}; } catch (e) { return {}; } }
+  const SESS = 'nestmate-sess';
+  function readSess() { return load(SESS); }
+  function saveSess() {
+    if (!S.me) return;
+    try { localStorage.setItem(SESS, JSON.stringify({ uid: S.me.id, since: S.connectedAt, lastSeen: Date.now(), status: S.status, room: S.roomId ? { id: S.roomId, joinedAt: S.roomJoinedAt } : null, cam: !!S.camOn })); } catch (e) {}
+  }
+  async function permGranted(name) { try { return (await navigator.permissions.query({ name })).state === 'granted'; } catch (e) { return false; } }
   function savePrefs() { try { localStorage.setItem('nestmate-prefs', JSON.stringify(S.prefs)); } catch (e) {} }
   function applyTheme() { if (S.prefs.theme) document.documentElement.dataset.theme = S.prefs.theme; else delete document.documentElement.dataset.theme; }
   applyTheme();
@@ -135,7 +143,7 @@
       <div class="seg" role="group" aria-label="상태">${Object.keys(ST).map((k) => `<button type="button" data-st="${k}" class="${S.status === k ? 'on' : ''}"><i class="dot ${k}"></i>${ST[k]}</button>`).join('')}</div>
       <label class="f">지금 뭐 하고 있나요<input class="field" id="stText" maxlength="40" placeholder="예: 파이썬 반복문 문제 푸는 중" value="${esc(S.text)}"></label>
       ${S.info.admin ? '<button class="btn sm" id="bAdm" type="button">스터디 공간 관리</button>' : ''}`;
-    el.querySelectorAll('[data-st]').forEach((b) => (b.onclick = () => { S.status = b.dataset.st; track(); renderMy(); }));
+    el.querySelectorAll('[data-st]').forEach((b) => (b.onclick = () => { S.status = b.dataset.st; track(); saveSess(); renderMy(); }));
     const t = $('#stText'); let tm;
     t.oninput = () => { clearTimeout(tm); tm = setTimeout(() => { S.text = t.value.trim(); track(); try { localStorage.setItem('nestmate-text', S.text); } catch (e) {} }, 500); };
     if ($('#bAdm')) $('#bAdm').onclick = openAdmin;
@@ -144,24 +152,27 @@
     const el = $('#roster'); if (!el) return;
     const list = [...S.people.values()].sort((a, b) => (a.id === S.me.id ? -1 : b.id === S.me.id ? 1 : a.since - b.since));
     el.innerHTML = `<div class="head"><h2>지금 접속 중</h2><span class="small muted">${list.length}명</span></div>
-      <ul>${list.map((p) => `<li class="person">${avatarHtml(p.id, 42, p.status)}<div class="txt"><b>${esc(nameOf(p.id))}${p.id === S.me.id ? ' <span class="tag">나</span>' : ''}${p.cam ? ' <span title="카메라 켬">📷</span>' : ''}${p.room ? ' <span class="tag">스터디룸</span>' : ''}</b><div class="sub">${esc(p.text || ST[p.status] || '')}</div></div><span class="t" data-since="${p.since}">${ago(Date.now() - p.since)}</span></li>`).join('') || '<div class="empty">아직 아무도 없습니다.</div>'}</ul>`;
+      <ul>${list.map((p) => `<li class="person">${avatarHtml(p.id, 42, p.status)}<div class="txt"><b>${esc(nameOf(p.id))}${p.id === S.me.id ? ' <span class="tag">나</span>' : ''}${p.cam ? ' <span title="카메라 켬">📷</span>' : ''}${p.room ? ` <span class="tag">${esc(roomName(p.room))}</span>` : ''}</b><div class="sub">${esc(p.text || ST[p.status] || '')}</div></div><span class="t" data-since="${p.since}">${ago(Date.now() - p.since)}</span></li>`).join('') || '<div class="empty">아직 아무도 없습니다.</div>'}</ul>`;
   }
   setInterval(() => {
     document.querySelectorAll('[data-since]').forEach((e) => (e.textContent = ago(Date.now() - Number(e.dataset.since))));
     const m = $('#myT'); if (m) m.textContent = clock(Date.now() - S.connectedAt);
+    const rt = $('#roomT'); if (rt && S.roomJoinedAt) rt.textContent = clock(Date.now() - S.roomJoinedAt);
   }, 1000);
+  setInterval(saveSess, 5000);
 
   /* ---------- 로비 (Presence) ---------- */
-  function myState() { return { id: S.me.id, status: S.status, text: S.text, since: S.connectedAt, cam: S.camOn, room: S.inRoom }; }
+  function myState() { return { id: S.me.id, status: S.status, text: S.text, since: S.connectedAt, cam: S.camOn, room: S.roomId || null }; }
   async function track() { if (S.lobby) { try { await S.lobby.track(myState()); } catch (e) {} } }
   async function joinLobby() {
     S.lobby = sb.channel('nestmate:lobby', { config: { private: true, presence: { key: S.me.id }, broadcast: { self: false } } });
     S.lobby.on('presence', { event: 'sync' }, async () => {
       const st = S.lobby.presenceState(); const m = new Map();
       Object.keys(st).forEach((k) => { const metas = st[k]; const last = metas[metas.length - 1]; if (last) m.set(k, { ...last, id: k }); });
-      S.people = m; await resolveNames([...m.keys()]); renderRoster(); renderChip(); renderMy();
+      S.people = m; await resolveNames([...m.keys()]); renderRoster(); renderChip(); renderMy(); renderRoom();
     });
     S.lobby.on('broadcast', { event: 'settings' }, () => loadSettings());
+    S.lobby.on('broadcast', { event: 'rooms' }, () => loadRooms());
     await new Promise((res) => S.lobby.subscribe(async (s) => { if (s === 'SUBSCRIBED') { await S.lobby.track(myState()); res(); } if (s === 'CHANNEL_ERROR' || s === 'TIMED_OUT') { toast('접속 현황 연결이 불안정합니다. 다시 시도하는 중입니다.'); } }));
   }
   async function loadSettings() {
@@ -205,29 +216,77 @@
     };
   }
 
-  /* ---------- 스터디룸 ---------- */
+  /* ---------- 스터디룸 (방 만들기 · 참여 · 채팅) ---------- */
   const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }] };
-  function roomCount() { return [...S.people.values()].filter((p) => p.room).length; }
+  const roomName = (id) => (S.rooms.find((r) => r.id === id) || (S.roomInfo && S.roomInfo.id === id ? S.roomInfo : null) || {}).name || '스터디룸';
+  const roomCount = (id) => [...S.people.values()].filter((p) => p.room === id).length;
+  const isOwner = () => !!S.roomInfo && !!S.me && (S.roomInfo.owner === S.me.id || !!S.info.admin);
+  const hm = (iso) => { const d = new Date(iso); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); };
+
+  async function loadRooms() {
+    if (!S.me) return;
+    const { data, error } = await sb.rpc('nm_room_list');
+    if (error) return;
+    S.rooms = data || [];
+    await resolveNames([...new Set(S.rooms.map((r) => r.owner))]);
+    renderRoster(); renderRoom();
+  }
+  setInterval(() => { if (S.me && S.lobby) loadRooms(); }, 15000);
+
+  async function createRoom(name) {
+    name = String(name || '').trim();
+    if (!name) { toast('방 이름을 적어 주세요.'); return; }
+    const { data, error } = await sb.rpc('nm_room_create', { p_name: name });
+    if (error || !data) { toast(/locked/.test(error && error.message) ? '지금은 방을 만들 수 없습니다.' : /too many/.test(error && error.message) ? '만들 수 있는 방은 최대 3개입니다.' : '방을 만들지 못했습니다.'); return; }
+    S.lobby && S.lobby.send({ type: 'broadcast', event: 'rooms', payload: {} });
+    await loadRooms(); joinRoom(data.id);
+  }
+
   function renderRoom() {
     const el = $('#room'); if (!el) return;
     if (S.pip && S.pip.doc) return; // PIP 중에는 창 안쪽을 그대로 둠
+    if (!S.inRoom) renderRoomList(el); else renderRoomView(el);
+  }
+  function renderRoomList(el) {
+    if (el.dataset.mode !== 'lobby') {
+      el.dataset.mode = 'lobby';
+      el.innerHTML = `<div class="head"><h2>스터디룸</h2><span class="small muted" id="rmMeta"></span></div>
+        <form class="mk" id="mkForm"><input class="field" id="mkName" maxlength="30" placeholder="방 이름 (예: 파이썬 같이 풀기)" autocomplete="off"><button class="btn pri" type="submit">방 만들기</button></form>
+        <div class="rlist" id="rlist"></div>
+        <p class="small muted rnote">방에 사람이 5분 동안 없으면 자동으로 닫혀요. 새로고침해도 들어가 있던 방에 다시 들어가요.</p>`;
+      $('#mkForm').onsubmit = (e) => { e.preventDefault(); const i = $('#mkName'); const v = i.value; i.value = ''; createRoom(v); };
+    }
     const locked = S.settings.room_locked && !S.info.admin;
-    const full = !S.inRoom && roomCount() >= S.settings.room_max;
-    el.innerHTML = `<div class="head"><h2>스터디룸</h2><span class="small muted">${roomCount()} / ${S.settings.room_max}명${S.settings.room_locked ? ' · 잠김' : ''}</span><span class="sp"></span>
-      ${S.inRoom ? '<span class="pipbar"><button class="btn sm" id="bPip" type="button">PIP 창</button></span>' : ''}</div>
-      <div class="stage" id="stage">${S.inRoom ? '<div class="tiles" id="tiles"></div>' : `<div class="hint"><h3>같이 공부할 사람을 만나 보세요</h3><p>입장하면 카메라와 마이크는 꺼진 채로 시작해도 됩니다. 켜면 배경 블러가 적용됩니다.</p>
-        <button class="btn pri" id="bJoin" type="button" ${locked || full ? 'disabled' : ''}>${locked ? '지금은 잠겨 있습니다' : full ? '자리가 가득 찼습니다' : '스터디룸 입장'}</button></div>`}</div>
-      ${S.inRoom ? `<div class="controls">
-        <button class="btn ${S.micOn ? 'on' : ''}" id="bMic" type="button">${S.micOn ? '마이크 켬' : '마이크 끔'}</button>
-        <button class="btn ${S.camOn ? 'on' : ''}" id="bCam" type="button">${S.camOn ? '카메라 켬' : '카메라 끔'}</button>
-        <button class="btn ${S.prefs.blur ? 'on' : ''}" id="bBlur" type="button">배경 블러 ${S.prefs.blur ? '켬' : '끔'}</button>
-        <span class="sp"></span><button class="btn bad" id="bLeave" type="button">나가기</button></div>` : ''}`;
-    if (S.inRoom) { drawTiles(); }
-    const j = $('#bJoin'); if (j) j.onclick = joinRoom;
-    if (!S.inRoom) return;
-    $('#bMic').onclick = toggleMic; $('#bCam').onclick = toggleCam; $('#bLeave').onclick = leaveRoom;
+    $('#rmMeta').textContent = `${S.rooms.length}개 열려 있음${S.settings.room_locked ? ' · 잠김' : ''}`;
+    const box = $('#rlist');
+    box.innerHTML = S.rooms.map((r) => {
+      const n = roomCount(r.id); const full = n >= S.settings.room_max;
+      const left = Math.max(0, Math.ceil((new Date(r.last_active).getTime() + 300000 - Date.now()) / 60000));
+      return `<div class="rcard"><div class="rinfo"><b>${esc(r.name)}</b><div class="small muted">방장 ${esc(nameOf(r.owner))} · ${n} / ${S.settings.room_max}명${r.chat_on ? ' · 채팅' : ''}${n === 0 ? ` · 비어 있음, 약 ${left}분 뒤 닫혀요` : ''}</div></div>
+        <button class="btn sm pri" data-join="${esc(r.id)}" type="button" ${locked || full ? 'disabled' : ''}>${locked ? '잠김' : full ? '가득 참' : '참여'}</button></div>`;
+    }).join('') || '<div class="hint"><h3>열려 있는 방이 없어요</h3><p>위에서 방을 만들면 다른 사람이 바로 들어올 수 있어요.</p></div>';
+    box.querySelectorAll('[data-join]').forEach((b) => (b.onclick = () => joinRoom(b.dataset.join)));
+  }
+  function renderRoomView(el) {
+    if (el.dataset.mode !== 'room') {
+      el.dataset.mode = 'room';
+      el.innerHTML = `<div class="head" id="rhead"></div><div class="stage rstage"><div class="tiles" id="tiles"></div><aside class="chat" id="chat"></aside></div><div class="controls" id="rctl"></div>`;
+      renderChatShell();
+    }
+    const owner = S.roomInfo ? nameOf(S.roomInfo.owner) : '';
+    $('#rhead').innerHTML = `<h2>${esc(roomName(S.roomId))}</h2><span class="small muted">방장 ${esc(owner)} · ${roomCount(S.roomId)} / ${S.settings.room_max}명 · 참여 <span class="mono" id="roomT">${clock(Date.now() - S.roomJoinedAt)}</span></span><span class="sp"></span><span class="pipbar"><button class="btn sm" id="bPip" type="button">PIP 창</button></span>`;
+    const chatOn = !!(S.roomInfo && S.roomInfo.chat_on);
+    $('#rctl').innerHTML = `
+      <button class="btn ${S.micOn ? 'on' : ''}" id="bMic" type="button">${S.micOn ? '마이크 켬' : '마이크 끔'}</button>
+      <button class="btn ${S.camOn ? 'on' : ''}" id="bCam" type="button">${S.camOn ? '카메라 켬' : '카메라 끔'}</button>
+      <button class="btn ${S.prefs.blur ? 'on' : ''}" id="bBlur" type="button">배경 블러 ${S.prefs.blur ? '켬' : '끔'}</button>
+      ${isOwner() ? `<button class="btn ${chatOn ? 'on' : ''}" id="bChat" type="button">채팅 ${chatOn ? '켬' : '끔'}</button><button class="btn" id="bClose" type="button">방 닫기</button>` : ''}
+      <span class="sp"></span><button class="btn bad" id="bLeave" type="button">나가기</button>`;
+    drawTiles();
+    $('#bMic').onclick = toggleMic; $('#bCam').onclick = toggleCam; $('#bLeave').onclick = () => leaveRoom();
     $('#bBlur').onclick = () => { S.prefs.blur = !S.prefs.blur; savePrefs(); applyBlur(); renderRoom(); };
     $('#bPip').onclick = openPip;
+    if ($('#bChat')) { $('#bChat').onclick = toggleChat; $('#bClose').onclick = closeRoom; }
   }
   function tileEl(uid, stream, isMe) {
     const d = document.createElement('div'); d.className = 'tile' + (isMe && S.prefs.mirror ? ' mirror' : ''); d.dataset.uid = uid;
@@ -247,36 +306,116 @@
     S.rtc.forEach((c, uid) => box.appendChild(tileEl(uid, c.stream, false)));
   }
 
-  async function joinRoom() {
+  /* --- 채팅 (방장이 끄고 켤 수 있음, 방이 닫히면 기록 삭제) --- */
+  function renderChatShell() {
+    const c = $('#chat'); if (!c) return;
+    c.innerHTML = `<div class="chead"><b>채팅</b><span class="small muted" id="chState"></span></div><div class="msgs" id="msgs"></div>
+      <form class="cform" id="cForm"><input class="field" id="cIn" maxlength="500" placeholder="메시지 입력" autocomplete="off"><button class="btn pri sm" type="submit">보내기</button></form>`;
+    $('#cForm').onsubmit = (e) => { e.preventDefault(); const i = $('#cIn'); const v = i.value.trim(); if (!v) return; i.value = ''; sendChat(v); };
+    renderChatBar();
+  }
+  function renderChatBar() {
+    const f = $('#cForm'); if (!f) return;
+    const on = !!(S.roomInfo && S.roomInfo.chat_on);
+    f.hidden = !on; $('#chState').textContent = on ? '' : '꺼짐';
+    if (on) renderMsgs(); else $('#msgs').innerHTML = '<div class="empty">방장이 채팅을 꺼 두었어요.</div>';
+  }
+  function renderMsgs() {
+    const m = $('#msgs'); if (!m || !(S.roomInfo && S.roomInfo.chat_on)) return;
+    const near = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+    m.innerHTML = S.chat.map((x) => { const me = x.user_id === S.me.id; return `<div class="msg ${me ? 'me' : ''}">${me ? '' : `<span class="mn">${esc(nameOf(x.user_id))}</span>`}<span class="mb">${esc(x.body)}</span><time>${hm(x.created_at)}</time></div>`; }).join('') || '<div class="empty">첫 메시지를 남겨 보세요.</div>';
+    if (near) m.scrollTop = m.scrollHeight;
+  }
+  let chatT = null;
+  function loadChat() {
+    clearTimeout(chatT);
+    chatT = setTimeout(async () => {
+      if (!S.roomId || !(S.roomInfo && S.roomInfo.chat_on)) return;
+      const { data } = await sb.rpc('nm_chat_list', { p_id: S.roomId });
+      if (!data) return;
+      S.chat = data; await resolveNames([...new Set(data.map((x) => x.user_id))]); renderMsgs();
+      const m = $('#msgs'); if (m) m.scrollTop = m.scrollHeight;
+    }, 120);
+  }
+  async function sendChat(body) {
+    const { data, error } = await sb.rpc('nm_chat_send', { p_id: S.roomId, p_body: body });
+    if (error || !data) { toast(/chat off/.test(error && error.message) ? '채팅이 꺼져 있어요.' : '메시지를 보내지 못했어요.'); pingRoom(); return; }
+    if (!S.chat.some((x) => x.id === data.id)) S.chat.push(data);
+    renderMsgs(); const m = $('#msgs'); if (m) m.scrollTop = m.scrollHeight;
+    S.room && S.room.send({ type: 'broadcast', event: 'chat', payload: { id: data.id } });
+  }
+  async function toggleChat() {
+    const on = !S.roomInfo.chat_on;
+    const { data, error } = await sb.rpc('nm_room_set_chat', { p_id: S.roomId, p_on: on });
+    if (error || !data) { toast('채팅 설정을 바꾸지 못했어요.'); return; }
+    S.roomInfo.chat_on = on; S.room && S.room.send({ type: 'broadcast', event: 'chatsw', payload: {} });
+    if (on) loadChat(); renderChatBar(); renderRoom(); loadRooms();
+    S.lobby && S.lobby.send({ type: 'broadcast', event: 'rooms', payload: {} });
+  }
+  async function closeRoom() {
+    if (!confirm('방을 닫을까요? 안에 있는 사람이 모두 나가게 돼요.')) return;
+    const { data } = await sb.rpc('nm_room_close', { p_id: S.roomId });
+    if (!data) { toast('방을 닫지 못했어요.'); return; }
+    S.room && S.room.send({ type: 'broadcast', event: 'closed', payload: {} });
+    await leaveRoom(); S.lobby && S.lobby.send({ type: 'broadcast', event: 'rooms', payload: {} }); loadRooms();
+  }
+  // 30초마다 "사람이 있다"고 알려서 방이 닫히지 않게 함. 방이 닫혔거나 채팅 설정이 바뀌었으면 여기서 반영
+  async function pingRoom() {
+    if (!S.roomId) return;
+    const id = S.roomId;
+    const { data, error } = await sb.rpc('nm_room_ping', { p_id: id });
+    if (error || !data || id !== S.roomId) return;
+    if (!data.open) { toast('방이 닫혔어요.'); await leaveRoom(); loadRooms(); return; }
+    const was = !!(S.roomInfo && S.roomInfo.chat_on);
+    S.roomInfo = Object.assign({ id }, data);
+    if (was !== !!data.chat_on) { if (data.chat_on) loadChat(); renderChatBar(); renderRoom(); }
+  }
+
+  async function joinRoom(id, opts) {
+    opts = opts || {};
     if (S.inRoom) return;
     if (S.settings.room_locked && !S.info.admin) { toast('지금은 스터디룸이 잠겨 있습니다.'); return; }
-    S.inRoom = true; S.micOn = !!S.prefs.micOn; S.camOn = false; S.local = new MediaStream();
-    try {
-      const a = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-      a.getAudioTracks().forEach((t) => { t.enabled = S.micOn; S.local.addTrack(t); });
-    } catch (e) { S.micOn = false; toast('마이크를 사용할 수 없어 소리 없이 입장합니다.'); }
-    S.room = sb.channel('nestmate:room', { config: { private: true, presence: { key: S.me.id }, broadcast: { self: false } } });
+    if (!opts.restore && roomCount(id) >= S.settings.room_max) { toast('자리가 가득 찼어요.'); return; }
+    const { data, error } = await sb.rpc('nm_room_ping', { p_id: id });
+    if (error || !data || !data.open) { toast('이 방은 이미 닫혔어요.'); saveSess(); loadRooms(); return; }
+    S.inRoom = true; S.roomId = id; S.roomInfo = Object.assign({ id }, data); S.roomJoinedAt = opts.joinedAt || Date.now(); S.chat = [];
+    S.micOn = !!S.prefs.micOn; S.camOn = false; S.local = new MediaStream();
+    saveSess(); renderRoom();
+    if (!opts.restore || (await permGranted('microphone'))) {
+      try {
+        const a = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        a.getAudioTracks().forEach((t) => { t.enabled = S.micOn; S.local.addTrack(t); });
+      } catch (e) { S.micOn = false; toast('마이크를 사용할 수 없어 소리 없이 입장합니다.'); }
+    } else { S.micOn = false; toast('새로고침 후 마이크가 꺼졌어요. 필요하면 다시 켜 주세요.'); }
+    if (S.roomId !== id) return;
+    S.room = sb.channel('nestmate:room:' + id, { config: { private: true, presence: { key: S.me.id }, broadcast: { self: false } } });
     S.room.on('presence', { event: 'sync' }, onRoomSync);
     S.room.on('broadcast', { event: 'sig' }, ({ payload }) => onSignal(payload));
+    S.room.on('broadcast', { event: 'chat' }, () => loadChat());
+    S.room.on('broadcast', { event: 'chatsw' }, () => pingRoom());
+    S.room.on('broadcast', { event: 'closed' }, () => pingRoom());
     S.room.subscribe(async (s) => { if (s === 'SUBSCRIBED') await S.room.track({ id: S.me.id, t: Date.now() }); });
-    track(); renderRoom();
+    clearInterval(S.pingT); S.pingT = setInterval(pingRoom, 30000);
+    track(); saveSess(); renderRoom(); renderRoster(); loadChat();
+    if (opts.cam && (await permGranted('camera'))) toggleCam();
   }
   async function leaveRoom() {
     if (!S.inRoom) return;
-    closePip();
+    closePip(); clearInterval(S.pingT); S.pingT = null;
     S.rtc.forEach((c) => { try { c.pc.close(); } catch (e) {} }); S.rtc.clear();
     stopBlur();
     [S.local, S.raw].forEach((st) => st && st.getTracks().forEach((t) => t.stop()));
-    S.local = S.raw = null; S.camOn = false; S.inRoom = false;
-    if (S.room) { try { await sb.removeChannel(S.room); } catch (e) {} S.room = null; }
-    track(); renderRoom();
+    S.local = S.raw = null; S.camOn = false; S.inRoom = false; S.roomId = null; S.roomInfo = null; S.roomJoinedAt = 0; S.chat = [];
+    const old = S.room; S.room = null; if (old) { try { await sb.removeChannel(old); } catch (e) {} }
+    const el = $('#room'); if (el) el.dataset.mode = '';
+    track(); saveSess(); renderRoom(); renderRoster(); loadRooms();
   }
   function onRoomSync() {
     const ids = Object.keys(S.room.presenceState()).filter((k) => k !== S.me.id);
     resolveNames(ids).then(() => {
       ids.forEach((uid) => { if (!S.rtc.has(uid) && S.me.id < uid) connect(uid, true); });
       [...S.rtc.keys()].forEach((uid) => { if (!ids.includes(uid)) dropPeer(uid); });
-      drawTiles();
+      drawTiles(); renderRoom();
     });
   }
   function dropPeer(uid) { const c = S.rtc.get(uid); if (c) { try { c.pc.close(); } catch (e) {} S.rtc.delete(uid); } }
@@ -320,7 +459,7 @@
 
   /* ---------- 카메라 · 배경 블러 ---------- */
   async function toggleCam() {
-    if (S.camOn) { setVideoTrack(null); S.raw && S.raw.getTracks().forEach((t) => t.stop()); S.raw = null; stopBlur(); S.camOn = false; track(); renderRoom(); return; }
+    if (S.camOn) { setVideoTrack(null); S.raw && S.raw.getTracks().forEach((t) => t.stop()); S.raw = null; stopBlur(); S.camOn = false; track(); saveSess(); renderRoom(); return; }
     try { S.raw = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 24 } } }); }
     catch (e) { toast('카메라를 사용할 수 없습니다. 브라우저 권한을 확인해 주세요.'); return; }
     S.camOn = true; await applyBlur(); track(); renderRoom();
@@ -410,6 +549,7 @@
   async function logout() {
     await leaveRoom();
     if (S.lobby) { try { await sb.removeChannel(S.lobby); } catch (e) {} S.lobby = null; }
+    try { localStorage.removeItem(SESS); } catch (e) {}
     await sb.auth.signOut(); S.me = null; S.people.clear(); renderAuth();
   }
   async function boot() {
@@ -421,9 +561,11 @@
     S.info = info;
     if (!info.approved) { renderPending(info); return; }
     try { S.text = localStorage.getItem('nestmate-text') || ''; } catch (e) {}
-    S.connectedAt = Date.now(); S.names.clear();
+    const ss = readSess(); const keep = ss.uid === S.me.id && Date.now() - (ss.lastSeen || 0) < 600000;
+    S.connectedAt = keep && ss.since ? ss.since : Date.now(); if (keep && ST[ss.status]) S.status = ss.status; S.names.clear();
     await resolveNames([S.me.id]); A.loadItems().then(() => renderAll());
-    shell(); await loadSettings(); await joinLobby();
+    shell(); await loadSettings(); await joinLobby(); await loadRooms(); saveSess();
+    if (keep && ss.room && ss.room.id) joinRoom(ss.room.id, { restore: true, joinedAt: ss.room.joinedAt, cam: ss.cam });
   }
   window.addEventListener('pagehide', () => { try { S.rtc.forEach((c) => c.pc.close()); } catch (e) {} });
   sb.auth.onAuthStateChange((ev) => { if (ev === 'SIGNED_OUT' && S.me) { S.me = null; renderAuth(); } });
