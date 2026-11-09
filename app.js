@@ -70,7 +70,7 @@
   function renderAuth(msg) {
     root.innerHTML = `
     <header class="top"><div class="wrap">
-      <a class="brand" href="./"><img src="assets/icon-192.png" alt="">Nestmate<small>by PyNest</small></a><span class="sp"></span>
+      <span class="brand"><a href="${esc(C.PYNEST_URL)}" title="PyNest로" aria-label="PyNest로"><img src="assets/icon-192.png" alt="PyNest"></a><a class="bn" href="./">Nestmate<small>by PyNest</small></a></span><span class="sp"></span>
       <nav class="links"><a href="${esc(C.PYNEST_URL)}">PyNest</a><a href="${esc(C.SHOP_URL)}">민혁닷컴</a></nav>
     </div></header>
     <main class="wrap hero"><div class="hero-in">
@@ -112,7 +112,7 @@
   function shell() {
     root.innerHTML = `
     <header class="top"><div class="wrap">
-      <a class="brand" href="./"><img src="assets/icon-192.png" alt="">Nestmate<small>by PyNest</small></a><span class="sp"></span>
+      <span class="brand"><a href="${esc(C.PYNEST_URL)}" title="PyNest로" aria-label="PyNest로"><img src="assets/icon-192.png" alt="PyNest"></a><a class="bn" href="./">Nestmate<small>by PyNest</small></a></span><span class="sp"></span>
       <nav class="links"><a href="${esc(C.PYNEST_URL)}">PyNest</a><a href="${esc(C.SHOP_URL)}">민혁닷컴</a></nav>
       <button class="btn sm" id="bSet" aria-label="설정">설정</button>
       <span class="me-chip" id="meChip"></span>
